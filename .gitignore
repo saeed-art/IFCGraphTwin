@@ -1,0 +1,16 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor settings
+.vscode/
+
+# Logs
+*.log
+
+# Environment files
+.env
+venv/
+
+# folders
+IFC_files/
