@@ -14,3 +14,5 @@ venv/
 
 # folders
 IFC_files/
+bckup/
+output/

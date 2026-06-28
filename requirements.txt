@@ -1,2 +1,3 @@
-# Python dependencies
-# Add packages as needed
+ifcopenshell
+neo4j
+psycopg2-binary

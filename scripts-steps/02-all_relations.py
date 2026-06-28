@@ -22,6 +22,9 @@ import sys
 import ifcopenshell
 from neo4j import GraphDatabase
 
+from geometry import make_settings, extract_geometry
+from postgis_export import connect as pg_connect, setup_table, export_geometries
+
 # ── Local defaults (edit as needed) ──────────────────────────────────────────
 IFC_PATH     = "d:/Projects/01-IFC_structure/IFC_files/Simple/Duplex_A_20110907.ifc"
 NEO4J_URI    = "bolt://localhost:7687"
@@ -29,6 +32,7 @@ NEO4J_USER   = "neo4j"
 NEO4J_PASS   = "4262890Ab"
 CLEAR_DB     = True
 BATCH_SIZE   = 500   # nodes/rels per Neo4j transaction
+PG_DSN       = "host=localhost port=5432 dbname=postgis_ifc user=postgres password=4262890"
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -65,8 +69,10 @@ def extract(ifc_path: str):
     print(f"Opening IFC file: {ifc_path}")
     ifc = ifcopenshell.open(ifc_path)
 
-    # ── 1. Collect nodes ──────────────────────────────────────────────────────
+    # ── 1. Collect nodes + geometry ───────────────────────────────────────────
+    geom_settings = make_settings()          # create once, reuse for all entities
     nodes = {}
+    geom_count = 0
     for entity in ifc:
         gid = getattr(entity, 'GlobalId', None)
         if not gid:
@@ -74,12 +80,17 @@ def extract(ifc_path: str):
         # IfcRel* entities become edges — exclude them from the node set
         if entity.is_a('IfcRelationship'):
             continue
+        geom = extract_geometry(entity, geom_settings)
+        if geom:
+            geom_count += 1
         nodes[gid] = {
             'globalId': gid,
             'ifcType':  entity.is_a(),
             'name':     get_safe_name(entity),
+            'geometry': geom,            # dict with vertices/faces, or None
         }
     print(f"  Entities with GlobalId : {len(nodes)}")
+    print(f"  Entities with geometry : {geom_count}")
 
     # ── 2. Discover relationships via IfcRelationship entities ────────────────
     seen = set()
@@ -228,13 +239,28 @@ def load(uri: str, user: str, password: str,
 
 
 def _write_nodes(tx, batch: list):
-    """MERGE a batch of nodes; label = ifcType."""
+    """MERGE a batch of nodes with derived geometric properties.
+
+    Stores compact, queryable properties in Neo4j.
+    Raw vertices/faces stay in PostGIS only — not written here.
+    """
     for n in batch:
         label = n['ifcType']
+        geom  = n.get('geometry')   # dict with derived props, or None
         tx.run(
             f"MERGE (x:{label} {{globalId:$gid}}) "
-            "SET x.name=$name, x.ifcType=$ifcType",
-            gid=n['globalId'], name=n['name'], ifcType=n['ifcType']
+            "SET x.name=$name, x.ifcType=$ifcType, "
+            "x.centroid=$centroid, x.boundingBox=$bounding_box, "
+            "x.floorLevel=$floor_level, "
+            "x.volume=$volume, x.surfaceArea=$surface_area",
+            gid=n['globalId'],
+            name=n['name'],
+            ifcType=n['ifcType'],
+            centroid=     geom['centroid']     if geom else None,
+            bounding_box= geom['bounding_box'] if geom else None,
+            floor_level=  geom['floor_level']  if geom else None,
+            volume=       geom['volume']        if geom else None,
+            surface_area= geom['surface_area']  if geom else None,
         )
 
 
@@ -252,13 +278,15 @@ def _write_rels(tx, batch: list):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Extract ALL IFC relationships generically and load into Neo4j'
+        description='Extract ALL IFC relationships generically and load into Neo4j + PostGIS'
     )
     parser.add_argument('--ifc',      default=IFC_PATH,    help='Path to IFC file')
     parser.add_argument('--uri',      default=NEO4J_URI,   help='Neo4j bolt URI')
     parser.add_argument('--user',     default=NEO4J_USER,  help='Neo4j username')
     parser.add_argument('--password', default=NEO4J_PASS,  help='Neo4j password')
-    parser.add_argument('--no-clear', action='store_true',  help='Skip clearing the DB')
+    parser.add_argument('--no-clear', action='store_true',  help='Skip clearing Neo4j DB')
+    parser.add_argument('--pg-dsn',   default=PG_DSN,
+                        help='PostGIS DSN (set to empty string to skip PostGIS export)')
     args = parser.parse_args()
 
     try:
@@ -267,8 +295,23 @@ def main():
         print(f"Error reading IFC file: {e}")
         sys.exit(1)
 
+    # ── Neo4j ───────────────────────────────────────────────────────────────────
     load(args.uri, args.user, args.password,
          nodes, rels, clear=not args.no_clear)
+
+    # ── PostGIS ────────────────────────────────────────────────────────────
+    if args.pg_dsn:
+        print("\nExporting geometry to PostGIS …")
+        try:
+            pg_conn = pg_connect(args.pg_dsn)
+            setup_table(pg_conn)
+            export_geometries(pg_conn, nodes)
+            pg_conn.close()
+        except Exception as e:
+            print(f"  PostGIS export failed: {e}")
+            print("  (Skipping — Neo4j data is unaffected)")
+    else:
+        print("\nPostGIS export skipped (--pg-dsn is empty).")
 
     print("\nView your graph in Neo4j Browser (http://localhost:7474):")
     print("  MATCH (n)-[r]->(m) RETURN n,r,m LIMIT 200")
