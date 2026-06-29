@@ -92,6 +92,34 @@ def extract(ifc_path: str):
     print(f"  Entities with GlobalId : {len(nodes)}")
     print(f"  Entities with geometry : {geom_count}")
 
+    # ── 1.5. Map each element to its containing IfcSpace ───────────────────────
+    # IfcRelContainedInSpatialStructure links elements to the space/storey/site
+    # that directly contains them. We only keep the IfcSpace level.
+    space_map: dict[str, dict] = {}   # element GlobalId → space info
+    for rel in ifc.by_type('IfcRelContainedInSpatialStructure'):
+        structure = rel.RelatingStructure
+        if not structure.is_a('IfcSpace'):
+            continue
+        space_gid  = getattr(structure, 'GlobalId', None)
+        space_name = get_safe_name(structure)
+        for elem in rel.RelatedElements:
+            elem_gid = getattr(elem, 'GlobalId', None)
+            if elem_gid and elem_gid in nodes:
+                space_map[elem_gid] = {
+                    'space_globalId': space_gid,
+                    'space_name':     space_name,
+                }
+
+    # Enrich nodes with space info (None when element is not in an IfcSpace)
+    space_count = 0
+    for gid, node in nodes.items():
+        sp = space_map.get(gid, {})
+        node['space_globalId'] = sp.get('space_globalId')
+        node['space_name']     = sp.get('space_name')
+        if sp:
+            space_count += 1
+    print(f"  Elements linked to space : {space_count}")
+
     # ── 2. Discover relationships via IfcRelationship entities ────────────────
     seen = set()
     relationships = []
@@ -239,7 +267,7 @@ def load(uri: str, user: str, password: str,
 
 
 def _write_nodes(tx, batch: list):
-    """MERGE a batch of nodes with derived geometric properties.
+    """MERGE a batch of nodes with derived geometric and spatial properties.
 
     Stores compact, queryable properties in Neo4j.
     Raw vertices/faces stay in PostGIS only — not written here.
@@ -252,7 +280,8 @@ def _write_nodes(tx, batch: list):
             "SET x.name=$name, x.ifcType=$ifcType, "
             "x.centroid=$centroid, x.boundingBox=$bounding_box, "
             "x.floorLevel=$floor_level, "
-            "x.volume=$volume, x.surfaceArea=$surface_area",
+            "x.volume=$volume, x.surfaceArea=$surface_area, "
+            "x.spaceGlobalId=$space_gid, x.spaceName=$space_name",
             gid=n['globalId'],
             name=n['name'],
             ifcType=n['ifcType'],
@@ -261,6 +290,8 @@ def _write_nodes(tx, batch: list):
             floor_level=  geom['floor_level']  if geom else None,
             volume=       geom['volume']        if geom else None,
             surface_area= geom['surface_area']  if geom else None,
+            space_gid=    n.get('space_globalId'),
+            space_name=   n.get('space_name'),
         )
 
 

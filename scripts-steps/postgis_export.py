@@ -51,24 +51,34 @@ def connect(dsn: str = PG_DSN):
 def setup_table(conn):
     """Create the PostGIS extension and ifc_geometry table if they don't exist.
 
-    Safe to call on every run — uses IF NOT EXISTS everywhere.
+    Safe to call on every run against both new and existing tables.
+    ALTER TABLE ... ADD COLUMN IF NOT EXISTS migrates old tables automatically.
     """
     with conn.cursor() as cur:
         cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ifc_geometry (
-                global_id    TEXT             PRIMARY KEY,
-                ifc_type     TEXT,
-                name         TEXT,
-                floor_level  DOUBLE PRECISION,
-                volume       DOUBLE PRECISION,
-                surface_area DOUBLE PRECISION,
-                centroid_x   DOUBLE PRECISION,
-                centroid_y   DOUBLE PRECISION,
-                centroid_z   DOUBLE PRECISION,
-                geom         GEOMETRY(MULTIPOLYGONZ, 0)
+                global_id       TEXT             PRIMARY KEY,
+                ifc_type        TEXT,
+                name            TEXT,
+                floor_level     DOUBLE PRECISION,
+                volume          DOUBLE PRECISION,
+                surface_area    DOUBLE PRECISION,
+                centroid_x      DOUBLE PRECISION,
+                centroid_y      DOUBLE PRECISION,
+                centroid_z      DOUBLE PRECISION,
+                space_global_id TEXT,
+                space_name      TEXT,
+                geom            GEOMETRY(MULTIPOLYGONZ, 0)
             );
         """)
+        # ── Migrate existing tables: add any columns missing from older runs ──
+        migrations = [
+            "ALTER TABLE ifc_geometry ADD COLUMN IF NOT EXISTS space_global_id TEXT;",
+            "ALTER TABLE ifc_geometry ADD COLUMN IF NOT EXISTS space_name      TEXT;",
+        ]
+        for ddl in migrations:
+            cur.execute(ddl)
         # Spatial index so 3D range / intersection queries are fast
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_ifc_geometry_geom
@@ -78,6 +88,11 @@ def setup_table(conn):
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_ifc_geometry_type
             ON ifc_geometry (ifc_type);
+        """)
+        # Index on space for space-filtered queries
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ifc_geometry_space
+            ON ifc_geometry (space_global_id);
         """)
     conn.commit()
     print("  PostGIS table ready   : ifc_geometry")
@@ -139,6 +154,8 @@ def export_geometries(conn, nodes: dict, batch_size: int = BATCH_SIZE):
             geom.get('volume'),
             geom.get('surface_area'),
             c[0], c[1], c[2],
+            node.get('space_globalId'),
+            node.get('space_name'),
             wkt,
         ))
 
@@ -151,20 +168,23 @@ def export_geometries(conn, nodes: dict, batch_size: int = BATCH_SIZE):
             (global_id, ifc_type, name,
              floor_level, volume, surface_area,
              centroid_x, centroid_y, centroid_z,
+             space_global_id, space_name,
              geom)
         VALUES
-            (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
              ST_GeomFromText(%s, 0))
         ON CONFLICT (global_id) DO UPDATE SET
-            ifc_type     = EXCLUDED.ifc_type,
-            name         = EXCLUDED.name,
-            floor_level  = EXCLUDED.floor_level,
-            volume       = EXCLUDED.volume,
-            surface_area = EXCLUDED.surface_area,
-            centroid_x   = EXCLUDED.centroid_x,
-            centroid_y   = EXCLUDED.centroid_y,
-            centroid_z   = EXCLUDED.centroid_z,
-            geom         = EXCLUDED.geom;
+            ifc_type        = EXCLUDED.ifc_type,
+            name            = EXCLUDED.name,
+            floor_level     = EXCLUDED.floor_level,
+            volume          = EXCLUDED.volume,
+            surface_area    = EXCLUDED.surface_area,
+            centroid_x      = EXCLUDED.centroid_x,
+            centroid_y      = EXCLUDED.centroid_y,
+            centroid_z      = EXCLUDED.centroid_z,
+            space_global_id = EXCLUDED.space_global_id,
+            space_name      = EXCLUDED.space_name,
+            geom            = EXCLUDED.geom;
     """
 
     with conn.cursor() as cur:
